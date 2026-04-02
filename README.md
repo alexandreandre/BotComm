@@ -234,3 +234,5 @@ Creer un secret GCP nomme `SUPABASE_SERVICE_ROLE_KEY` (version `latest`), utilis
 - Adapter `movie-quiz` fourni en base demo avec selecteurs placeholders.
 - Pour un jeu reel, ajuster les selecteurs/strategie selon le DOM exact.
 - La V1 execute dans le process HTTP (pas encore de Cloud Run Jobs separes).
+
+Oui
