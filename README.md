@@ -1,6 +1,6 @@
 # CineContent — Bot + plateforme (Google Cloud + Supabase)
 
-Monorepo : **dispatcher Playwright** sur Cloud Run (`POST /dispatch`), **API Fastify** (`/api/*`, webhook bot) et **SPA** (dashboard). **Auth = Supabase Auth** (JWT). **Données = Postgres Supabase** + **Storage Supabase** (ou GCS). **IA = Gemini** (optionnel).
+Monorepo : **un seul service Cloud Run** sur le port **8080** — **dispatcher Playwright** (`POST /dispatch`), **API Fastify** (`/api/*`, webhook bot) et **SPA** (dashboard servie en statique par Fastify depuis `FRONTEND_DIST_PATH`). **Auth = Supabase Auth** (JWT). **Données = Postgres Supabase** + **Storage Supabase** (ou GCS). **IA = Gemini** (optionnel).
 
 ## Architecture
 
@@ -105,13 +105,43 @@ docker run --rm -p 8080:8080 --env-file .env cinecontent:local
 
 Les `VITE_*` sont figées au **build** de l’image.
 
-### GitHub Actions
+### GitHub Actions (déploiement)
 
-**Secrets** : `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`, `SUPABASE_URL`, **`SUPABASE_ANON_KEY`** (pour le build frontend ; distinct de la service role stockée dans GCP Secret Manager pour Cloud Run), + secret GCP `SUPABASE_SERVICE_ROLE_KEY`.
+Le workflow `.github/workflows/deploy-cloud-run.yml` construit **une image** (frontend Vite + backend TypeScript + Playwright) et déploie **un seul** service Cloud Run.
 
-**Variables** : `GCP_PROJECT_ID`, `GCP_REGION`, `ARTIFACT_REPO`, `PUBLIC_APP_URL`, `DEFAULT_STORAGE_BUCKET`, optionnel `CLOUD_RUN_SERVICE`, `STORAGE_BACKEND`, `GCS_BUCKET`.
+#### Secrets GitHub (Settings → Secrets and variables → Actions)
 
-Ajoute sur Cloud Run (Secret Manager) au minimum **`DATABASE_URL`** et monte-le avec `gcloud run services update --set-secrets=...` si ce n’est pas déjà dans le workflow.
+| Secret | Rôle |
+|--------|------|
+| **`GCP_SA_KEY`** | JSON du compte de service GCP (Artifact Registry + Cloud Run + idéalement accès Secret Manager). |
+| **`SUPABASE_URL`** | URL projet Supabase (ex. `https://xxx.supabase.co`). *Option* : la mettre en variable **`VITE_SUPABASE_URL`** à la place. |
+| **`SUPABASE_ANON_KEY`** | Clé **anon** (public) pour le build Vite. *Option* : variable **`VITE_SUPABASE_PUBLISHABLE_KEY`**. |
+
+#### Variables GitHub (repository *ou* organization)
+
+| Variable | Obligatoire | Rôle |
+|----------|-------------|------|
+| **`GCP_PROJECT_ID`** | oui | ID projet GCP. |
+| **`PUBLIC_APP_URL`** | fortement recommandé | URL publique du service Cloud Run **sans slash final** (ex. `https://mon-service-xxxxx-ew.a.run.app`), pour les webhooks bot (`play-game`). À aligner sur l’URL réelle après le premier déploiement (ou domaine custom). |
+| **`GCP_REGION`** | non | Défaut : `europe-west1`. |
+| **`ARTIFACT_REPO`** | non | Défaut : `cloud-run-images` (doit exister dans Artifact Registry). |
+| **`CLOUD_RUN_SERVICE`** ou **`BACKEND_SERVICE_NAME`** | non | Nom du service Cloud Run ; défaut : `cinecontent-bot-dispatcher`. |
+| **`VITE_SUPABASE_URL`** | si pas secret `SUPABASE_URL` | Même valeur que l’URL projet Supabase. |
+| **`VITE_SUPABASE_PUBLISHABLE_KEY`** | si pas secret `SUPABASE_ANON_KEY` | Clé anon pour le build. |
+| **`STORAGE_BACKEND`** | non | `supabase` (défaut) ou `gcs`. |
+| **`DEFAULT_STORAGE_BUCKET`** | non | Défaut : `gameplay-videos`. |
+| **`GCS_BUCKET`** | si `STORAGE_BACKEND=gcs` | Nom du bucket GCS. |
+
+#### Google Secret Manager (référencés par `--set-secrets` au déploiement)
+
+Crée ces secrets **dans le même projet GCP** ; le compte de service Cloud Run doit avoir **Secret Manager Secret Accessor** dessus.
+
+| Nom du secret (GCP) | Contenu |
+|---------------------|---------|
+| **`SUPABASE_SERVICE_ROLE_KEY`** | Clé **service_role** Supabase (jamais dans GitHub ni dans le frontend). |
+| **`DATABASE_URL`** | Chaîne Postgres Supabase (direct `:5432` ou pooler). |
+
+Optionnel ensuite : ajouter **`GEMINI_API_KEY`** (Secret Manager + entrée dans `gcloud run deploy --set-secrets`) si tu utilises l’IA côté API.
 
 ## Structure
 

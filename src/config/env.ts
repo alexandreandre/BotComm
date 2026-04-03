@@ -15,7 +15,10 @@ const envSchema = z
       (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
       z.string().min(1).optional()
     ),
-    GCS_BUCKET: z.string().min(1).optional(),
+    GCS_BUCKET: z.preprocess(
+      (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+      z.string().min(1).optional()
+    ),
     DATABASE_URL: z.string().min(1).optional(),
     /**
      * SSL pour pg : auto = activer si l’hôte ressemble à Supabase (recommandé en prod).
