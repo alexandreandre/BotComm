@@ -2,7 +2,7 @@
 
 Monorepo : **un seul service Cloud Run** sur le port **8080** — **dispatcher Playwright** (`POST /dispatch`), **API Fastify** (`/api/*`, webhook bot) et **SPA** (dashboard servie en statique par Fastify depuis `FRONTEND_DIST_PATH`). **Auth = Supabase Auth** (JWT). **Données = Postgres Supabase** + **Storage Supabase** (ou GCS). **IA = Gemini** (optionnel).
 
-## Architecture :
+## Architecture 
 
 | Couche | Rôle |
 |--------|------|
