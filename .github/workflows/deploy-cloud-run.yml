@@ -68,33 +68,53 @@ jobs:
         env:
           GCS_BUCKET_DEPLOY: ${{ vars.GCS_BUCKET }}
           PUBLIC_APP_URL_VAR: ${{ vars.PUBLIC_APP_URL }}
-          # Clé service_role : fichier YAML (évite troncature / caractères spéciaux dans --set-env-vars).
           SUPABASE_SERVICE_ROLE_KEY_DEPLOY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_URL_DEPLOY: ${{ secrets.SUPABASE_URL || vars.VITE_SUPABASE_URL }}
+          STORAGE_BACKEND_DEPLOY: ${{ vars.STORAGE_BACKEND || 'supabase' }}
+          DEFAULT_STORAGE_BUCKET_DEPLOY: ${{ vars.DEFAULT_STORAGE_BUCKET || 'gameplay-videos' }}
         run: |
           set -euo pipefail
-          if [ -z "${SUPABASE_SERVICE_ROLE_KEY_DEPLOY:-}" ]; then
-            echo "::error::Secret GitHub SUPABASE_SERVICE_ROLE_KEY manquant (Project Settings → API → service_role)."
-            exit 1
-          fi
-          node -e "require('fs').writeFileSync('/tmp/cloudrun-role.yaml','SUPABASE_SERVICE_ROLE_KEY: '+JSON.stringify(process.env.SUPABASE_SERVICE_ROLE_KEY_DEPLOY)+'\n')"
-          chmod 600 /tmp/cloudrun-role.yaml
-          EXTRA_ENV=""
-          if [ -n "${GCS_BUCKET_DEPLOY:-}" ]; then
-            EXTRA_ENV=",GCS_BUCKET=${GCS_BUCKET_DEPLOY}"
-          fi
-          SET_ENV="NODE_ENV=production,LOG_LEVEL=info,FRONTEND_DIST_PATH=/app/frontend-dist,BODY_LIMIT_BYTES=5242880,STORAGE_BACKEND=${{ vars.STORAGE_BACKEND || 'supabase' }},SUPABASE_URL=${{ secrets.SUPABASE_URL || vars.VITE_SUPABASE_URL }},DEFAULT_STORAGE_BUCKET=${{ vars.DEFAULT_STORAGE_BUCKET || 'gameplay-videos' }},PLAYWRIGHT_HEADLESS=true,PLAYWRIGHT_NAV_TIMEOUT_MS=30000,WEBHOOK_TIMEOUT_MS=10000,MAX_RUN_TIMEOUT_MS=120000,RUN_CONCURRENCY_LIMIT=2"
-          if [ -n "${PUBLIC_APP_URL_VAR:-}" ]; then
-            SET_ENV="${SET_ENV},PUBLIC_APP_URL=${PUBLIC_APP_URL_VAR}"
-          fi
-          SET_ENV="${SET_ENV}${EXTRA_ENV}"
-          # Cloud Run : une variable ne peut pas passer de Secret Manager → littéral dans le même `deploy`.
-          if gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" &>/dev/null; then
-            gcloud run services update "${SERVICE_NAME}" \
-              --project "${PROJECT_ID}" \
-              --region "${REGION}" \
-              --clear-secrets \
-              --quiet
-          fi
+          node <<'NODE'
+          const fs = require("fs");
+          const e = process.env;
+          if (!String(e.SUPABASE_SERVICE_ROLE_KEY_DEPLOY || "").trim()) {
+            console.error("Secret GitHub SUPABASE_SERVICE_ROLE_KEY manquant.");
+            process.exit(1);
+          }
+          if (!String(e.SUPABASE_URL_DEPLOY || "").trim()) {
+            console.error("SUPABASE_URL manquant (secret ou variable VITE_SUPABASE_URL).");
+            process.exit(1);
+          }
+          const pairs = {
+            NODE_ENV: "production",
+            LOG_LEVEL: "info",
+            FRONTEND_DIST_PATH: "/app/frontend-dist",
+            BODY_LIMIT_BYTES: "5242880",
+            STORAGE_BACKEND: e.STORAGE_BACKEND_DEPLOY || "supabase",
+            SUPABASE_URL: String(e.SUPABASE_URL_DEPLOY).trim(),
+            SUPABASE_SERVICE_ROLE_KEY: e.SUPABASE_SERVICE_ROLE_KEY_DEPLOY,
+            DEFAULT_STORAGE_BUCKET: e.DEFAULT_STORAGE_BUCKET_DEPLOY || "gameplay-videos",
+            PLAYWRIGHT_HEADLESS: "true",
+            PLAYWRIGHT_NAV_TIMEOUT_MS: "30000",
+            WEBHOOK_TIMEOUT_MS: "10000",
+            MAX_RUN_TIMEOUT_MS: "120000",
+            RUN_CONCURRENCY_LIMIT: "2"
+          };
+          if (String(e.PUBLIC_APP_URL_VAR || "").trim()) {
+            pairs.PUBLIC_APP_URL = String(e.PUBLIC_APP_URL_VAR).trim();
+          }
+          if (String(e.GCS_BUCKET_DEPLOY || "").trim()) {
+            pairs.GCS_BUCKET = String(e.GCS_BUCKET_DEPLOY).trim();
+          }
+          const yaml =
+            Object.entries(pairs)
+              .map(([k, v]) => `${k}: ${JSON.stringify(String(v))}`)
+              .join("\n") + "\n";
+          fs.writeFileSync("/tmp/cloudrun-env.yaml", yaml);
+          NODE
+          chmod 600 /tmp/cloudrun-env.yaml
+          # Un seul --env-vars-file : évite les bugs de fusion file + --set-env-vars.
+          # Pas de `services update --clear-secrets` ici : ça créait une révision intermédiaire qui échouait au démarrage.
           gcloud run deploy "${SERVICE_NAME}" \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
@@ -104,8 +124,7 @@ jobs:
             --port 8080 \
             --cpu-boost \
             --memory=1Gi \
-            --env-vars-file=/tmp/cloudrun-role.yaml \
-            --set-env-vars "${SET_ENV}"
+            --env-vars-file=/tmp/cloudrun-env.yaml
           RUN_URL="$(gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" --format='value(status.url)')"
           echo ""
           echo "::notice::URL Cloud Run : ${RUN_URL} — mets-la dans GitHub → Settings → Variables → PUBLIC_APP_URL (sans slash final), puis relance le workflow pour activer le webhook bot."
