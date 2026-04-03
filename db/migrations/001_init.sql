@@ -1,19 +1,53 @@
--- CineContent — schéma Supabase (auth.users, Storage, RLS).
--- À exécuter sur un projet Supabase (SQL Editor ou `npm run db:migrate` avec DATABASE_URL Supabase).
--- Ne pas réexécuter tel quel si les objets existent déjà.
+-- CineContent — schéma Supabase (idempotent, aligné sur schema_full.sql).
+-- npm run db:migrate ou SQL Editor Supabase.
+
+-- ============================================================
+-- CineContent — schéma Supabase (idempotent : réexécutable sans erreur)
+-- ============================================================
 
 -- ============================================================
 -- 1. ENUMS
 -- ============================================================
 
-CREATE TYPE public.caption_style AS ENUM ('punchy', 'clean', 'suspense', 'quiz_challenge', 'movie_fans', 'beat_this');
-CREATE TYPE public.clip_status AS ENUM ('rendering', 'rendered', 'ready_for_approval', 'approved', 'rejected', 'failed');
-CREATE TYPE public.log_category AS ENUM ('run', 'clip', 'caption', 'approval', 'publish', 'system');
-CREATE TYPE public.log_level AS ENUM ('info', 'warn', 'error', 'success');
-CREATE TYPE public.platform AS ENUM ('instagram', 'tiktok');
-CREATE TYPE public.publish_status AS ENUM ('pending', 'publishing', 'published', 'failed', 'retry');
-CREATE TYPE public.run_status AS ENUM ('pending', 'running', 'completed', 'failed', 'cancelled');
-CREATE TYPE public.strategy_status AS ENUM ('draft', 'active', 'paused', 'archived');
+DO $enum$ BEGIN
+  CREATE TYPE public.caption_style AS ENUM ('punchy', 'clean', 'suspense', 'quiz_challenge', 'movie_fans', 'beat_this');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $enum$;
+
+DO $enum$ BEGIN
+  CREATE TYPE public.clip_status AS ENUM ('rendering', 'rendered', 'ready_for_approval', 'approved', 'rejected', 'failed');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $enum$;
+
+DO $enum$ BEGIN
+  CREATE TYPE public.log_category AS ENUM ('run', 'clip', 'caption', 'approval', 'publish', 'system');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $enum$;
+
+DO $enum$ BEGIN
+  CREATE TYPE public.log_level AS ENUM ('info', 'warn', 'error', 'success');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $enum$;
+
+DO $enum$ BEGIN
+  CREATE TYPE public.platform AS ENUM ('instagram', 'tiktok');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $enum$;
+
+DO $enum$ BEGIN
+  CREATE TYPE public.publish_status AS ENUM ('pending', 'publishing', 'published', 'failed', 'retry');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $enum$;
+
+DO $enum$ BEGIN
+  CREATE TYPE public.run_status AS ENUM ('pending', 'running', 'completed', 'failed', 'cancelled');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $enum$;
+
+DO $enum$ BEGIN
+  CREATE TYPE public.strategy_status AS ENUM ('draft', 'active', 'paused', 'archived');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $enum$;
 
 -- ============================================================
 -- 2. FUNCTIONS
@@ -47,7 +81,7 @@ $$;
 -- 3. TABLES
 -- ============================================================
 
-CREATE TABLE public.profiles (
+CREATE TABLE IF NOT EXISTS public.profiles (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid NOT NULL UNIQUE,
   display_name text,
@@ -56,7 +90,7 @@ CREATE TABLE public.profiles (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE public.content_strategies (
+CREATE TABLE IF NOT EXISTS public.content_strategies (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid NOT NULL,
   name text NOT NULL,
@@ -75,7 +109,7 @@ CREATE TABLE public.content_strategies (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE public.runs (
+CREATE TABLE IF NOT EXISTS public.runs (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid NOT NULL,
   strategy_id uuid NOT NULL REFERENCES public.content_strategies(id),
@@ -96,7 +130,7 @@ CREATE TABLE public.runs (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE public.run_events (
+CREATE TABLE IF NOT EXISTS public.run_events (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   run_id uuid NOT NULL REFERENCES public.runs(id),
   event_type text NOT NULL,
@@ -105,7 +139,7 @@ CREATE TABLE public.run_events (
   timestamp timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE public.clips (
+CREATE TABLE IF NOT EXISTS public.clips (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid NOT NULL,
   run_id uuid NOT NULL REFERENCES public.runs(id),
@@ -125,7 +159,7 @@ CREATE TABLE public.clips (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE public.publish_jobs (
+CREATE TABLE IF NOT EXISTS public.publish_jobs (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid NOT NULL,
   clip_id uuid NOT NULL REFERENCES public.clips(id),
@@ -140,7 +174,7 @@ CREATE TABLE public.publish_jobs (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE public.published_posts (
+CREATE TABLE IF NOT EXISTS public.published_posts (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid NOT NULL,
   publish_job_id uuid NOT NULL REFERENCES public.publish_jobs(id),
@@ -159,7 +193,7 @@ CREATE TABLE public.published_posts (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE public.integrations (
+CREATE TABLE IF NOT EXISTS public.integrations (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid NOT NULL,
   platform text NOT NULL,
@@ -171,7 +205,7 @@ CREATE TABLE public.integrations (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE public.app_settings (
+CREATE TABLE IF NOT EXISTS public.app_settings (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid NOT NULL,
   key text NOT NULL,
@@ -181,7 +215,7 @@ CREATE TABLE public.app_settings (
   UNIQUE (user_id, key)
 );
 
-CREATE TABLE public.activity_logs (
+CREATE TABLE IF NOT EXISTS public.activity_logs (
   id uuid NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid NOT NULL,
   level log_level NOT NULL DEFAULT 'info',
@@ -197,18 +231,34 @@ CREATE TABLE public.activity_logs (
 -- 4. TRIGGERS
 -- ============================================================
 
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 CREATE TRIGGER on_auth_user_created
   AFTER INSERT ON auth.users
   FOR EACH ROW
   EXECUTE FUNCTION public.handle_new_user();
 
+DROP TRIGGER IF EXISTS update_profiles_updated_at ON public.profiles;
 CREATE TRIGGER update_profiles_updated_at BEFORE UPDATE ON public.profiles FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_content_strategies_updated_at ON public.content_strategies;
 CREATE TRIGGER update_content_strategies_updated_at BEFORE UPDATE ON public.content_strategies FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_runs_updated_at ON public.runs;
 CREATE TRIGGER update_runs_updated_at BEFORE UPDATE ON public.runs FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_clips_updated_at ON public.clips;
 CREATE TRIGGER update_clips_updated_at BEFORE UPDATE ON public.clips FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_publish_jobs_updated_at ON public.publish_jobs;
 CREATE TRIGGER update_publish_jobs_updated_at BEFORE UPDATE ON public.publish_jobs FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_published_posts_updated_at ON public.published_posts;
 CREATE TRIGGER update_published_posts_updated_at BEFORE UPDATE ON public.published_posts FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_integrations_updated_at ON public.integrations;
 CREATE TRIGGER update_integrations_updated_at BEFORE UPDATE ON public.integrations FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_app_settings_updated_at ON public.app_settings;
 CREATE TRIGGER update_app_settings_updated_at BEFORE UPDATE ON public.app_settings FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
 -- ============================================================
@@ -216,73 +266,131 @@ CREATE TRIGGER update_app_settings_updated_at BEFORE UPDATE ON public.app_settin
 -- ============================================================
 
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can view own profile" ON public.profiles;
 CREATE POLICY "Users can view own profile" ON public.profiles FOR SELECT USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can insert own profile" ON public.profiles;
 CREATE POLICY "Users can insert own profile" ON public.profiles FOR INSERT WITH CHECK (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can update own profile" ON public.profiles;
 CREATE POLICY "Users can update own profile" ON public.profiles FOR UPDATE USING (auth.uid() = user_id);
 
 ALTER TABLE public.content_strategies ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can view own strategies" ON public.content_strategies;
 CREATE POLICY "Users can view own strategies" ON public.content_strategies FOR SELECT USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can create own strategies" ON public.content_strategies;
 CREATE POLICY "Users can create own strategies" ON public.content_strategies FOR INSERT WITH CHECK (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can update own strategies" ON public.content_strategies;
 CREATE POLICY "Users can update own strategies" ON public.content_strategies FOR UPDATE USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can delete own strategies" ON public.content_strategies;
 CREATE POLICY "Users can delete own strategies" ON public.content_strategies FOR DELETE USING (auth.uid() = user_id);
 
 ALTER TABLE public.runs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can view own runs" ON public.runs;
 CREATE POLICY "Users can view own runs" ON public.runs FOR SELECT USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can create own runs" ON public.runs;
 CREATE POLICY "Users can create own runs" ON public.runs FOR INSERT WITH CHECK (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can update own runs" ON public.runs;
 CREATE POLICY "Users can update own runs" ON public.runs FOR UPDATE USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can delete own runs" ON public.runs;
 CREATE POLICY "Users can delete own runs" ON public.runs FOR DELETE USING (auth.uid() = user_id);
 
 ALTER TABLE public.run_events ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Users can view events of own runs" ON public.run_events FOR SELECT USING (EXISTS (SELECT 1 FROM runs WHERE runs.id = run_events.run_id AND runs.user_id = auth.uid()));
-CREATE POLICY "Users can insert events for own runs" ON public.run_events FOR INSERT WITH CHECK (EXISTS (SELECT 1 FROM runs WHERE runs.id = run_events.run_id AND runs.user_id = auth.uid()));
+DROP POLICY IF EXISTS "Users can view events of own runs" ON public.run_events;
+CREATE POLICY "Users can view events of own runs" ON public.run_events FOR SELECT USING (EXISTS (SELECT 1 FROM public.runs WHERE public.runs.id = run_events.run_id AND public.runs.user_id = auth.uid()));
+DROP POLICY IF EXISTS "Users can insert events for own runs" ON public.run_events;
+CREATE POLICY "Users can insert events for own runs" ON public.run_events FOR INSERT WITH CHECK (EXISTS (SELECT 1 FROM public.runs WHERE public.runs.id = run_events.run_id AND public.runs.user_id = auth.uid()));
 
 ALTER TABLE public.clips ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can view own clips" ON public.clips;
 CREATE POLICY "Users can view own clips" ON public.clips FOR SELECT USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can create own clips" ON public.clips;
 CREATE POLICY "Users can create own clips" ON public.clips FOR INSERT WITH CHECK (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can update own clips" ON public.clips;
 CREATE POLICY "Users can update own clips" ON public.clips FOR UPDATE USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can delete own clips" ON public.clips;
 CREATE POLICY "Users can delete own clips" ON public.clips FOR DELETE USING (auth.uid() = user_id);
 
 ALTER TABLE public.publish_jobs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can view own publish jobs" ON public.publish_jobs;
 CREATE POLICY "Users can view own publish jobs" ON public.publish_jobs FOR SELECT USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can create own publish jobs" ON public.publish_jobs;
 CREATE POLICY "Users can create own publish jobs" ON public.publish_jobs FOR INSERT WITH CHECK (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can update own publish jobs" ON public.publish_jobs;
 CREATE POLICY "Users can update own publish jobs" ON public.publish_jobs FOR UPDATE USING (auth.uid() = user_id);
 
 ALTER TABLE public.published_posts ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can view own posts" ON public.published_posts;
 CREATE POLICY "Users can view own posts" ON public.published_posts FOR SELECT USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can create own posts" ON public.published_posts;
 CREATE POLICY "Users can create own posts" ON public.published_posts FOR INSERT WITH CHECK (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can update own posts" ON public.published_posts;
 CREATE POLICY "Users can update own posts" ON public.published_posts FOR UPDATE USING (auth.uid() = user_id);
 
 ALTER TABLE public.integrations ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can view own integrations" ON public.integrations;
 CREATE POLICY "Users can view own integrations" ON public.integrations FOR SELECT USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can create own integrations" ON public.integrations;
 CREATE POLICY "Users can create own integrations" ON public.integrations FOR INSERT WITH CHECK (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can update own integrations" ON public.integrations;
 CREATE POLICY "Users can update own integrations" ON public.integrations FOR UPDATE USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can delete own integrations" ON public.integrations;
 CREATE POLICY "Users can delete own integrations" ON public.integrations FOR DELETE USING (auth.uid() = user_id);
 
 ALTER TABLE public.app_settings ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can view own settings" ON public.app_settings;
 CREATE POLICY "Users can view own settings" ON public.app_settings FOR SELECT USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can create own settings" ON public.app_settings;
 CREATE POLICY "Users can create own settings" ON public.app_settings FOR INSERT WITH CHECK (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can update own settings" ON public.app_settings;
 CREATE POLICY "Users can update own settings" ON public.app_settings FOR UPDATE USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can delete own settings" ON public.app_settings;
 CREATE POLICY "Users can delete own settings" ON public.app_settings FOR DELETE USING (auth.uid() = user_id);
 
 ALTER TABLE public.activity_logs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can view own logs" ON public.activity_logs;
 CREATE POLICY "Users can view own logs" ON public.activity_logs FOR SELECT USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "Users can insert own logs" ON public.activity_logs;
 CREATE POLICY "Users can insert own logs" ON public.activity_logs FOR INSERT WITH CHECK (auth.uid() = user_id);
 
 -- ============================================================
 -- 6. STORAGE BUCKET
 -- ============================================================
 
-INSERT INTO storage.buckets (id, name, public) VALUES ('gameplay-videos', 'gameplay-videos', true)
-ON CONFLICT (id) DO NOTHING;
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('gameplay-videos', 'gameplay-videos', true)
+ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, public = EXCLUDED.public;
 
+DROP POLICY IF EXISTS "Public read gameplay videos" ON storage.objects;
 CREATE POLICY "Public read gameplay videos" ON storage.objects FOR SELECT USING (bucket_id = 'gameplay-videos');
+
+DROP POLICY IF EXISTS "Authenticated users can upload gameplay videos" ON storage.objects;
 CREATE POLICY "Authenticated users can upload gameplay videos" ON storage.objects FOR INSERT WITH CHECK (bucket_id = 'gameplay-videos' AND auth.role() = 'authenticated');
+
+DROP POLICY IF EXISTS "Users can update own gameplay videos" ON storage.objects;
 CREATE POLICY "Users can update own gameplay videos" ON storage.objects FOR UPDATE USING (bucket_id = 'gameplay-videos' AND auth.uid()::text = (storage.foldername(name))[1]);
+
+DROP POLICY IF EXISTS "Users can delete own gameplay videos" ON storage.objects;
 CREATE POLICY "Users can delete own gameplay videos" ON storage.objects FOR DELETE USING (bucket_id = 'gameplay-videos' AND auth.uid()::text = (storage.foldername(name))[1]);
 
 -- ============================================================
 -- 7. REALTIME
 -- ============================================================
 
-ALTER PUBLICATION supabase_realtime ADD TABLE public.runs;
-ALTER PUBLICATION supabase_realtime ADD TABLE public.clips;
+DO $pub$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'runs'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.runs;
+  END IF;
+END $pub$;
+
+DO $pub$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = 'clips'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.clips;
+  END IF;
+END $pub$;
