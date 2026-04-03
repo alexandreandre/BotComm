@@ -67,7 +67,8 @@ jobs:
       - name: Deploy to Cloud Run
         env:
           GCS_BUCKET_DEPLOY: ${{ vars.GCS_BUCKET }}
-          # Clé service_role : depuis GitHub (évite Secret Manager GCP). Ne pas mettre de virgule dans la valeur.
+          PUBLIC_APP_URL_VAR: ${{ vars.PUBLIC_APP_URL }}
+          # Clé service_role : fichier YAML (évite troncature / caractères spéciaux dans --set-env-vars).
           SUPABASE_SERVICE_ROLE_KEY_DEPLOY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set -euo pipefail
@@ -75,12 +76,18 @@ jobs:
             echo "::error::Secret GitHub SUPABASE_SERVICE_ROLE_KEY manquant (Project Settings → API → service_role)."
             exit 1
           fi
+          node -e "require('fs').writeFileSync('/tmp/cloudrun-role.yaml','SUPABASE_SERVICE_ROLE_KEY: '+JSON.stringify(process.env.SUPABASE_SERVICE_ROLE_KEY_DEPLOY)+'\n')"
+          chmod 600 /tmp/cloudrun-role.yaml
           EXTRA_ENV=""
           if [ -n "${GCS_BUCKET_DEPLOY:-}" ]; then
             EXTRA_ENV=",GCS_BUCKET=${GCS_BUCKET_DEPLOY}"
           fi
+          SET_ENV="NODE_ENV=production,LOG_LEVEL=info,FRONTEND_DIST_PATH=/app/frontend-dist,BODY_LIMIT_BYTES=5242880,STORAGE_BACKEND=${{ vars.STORAGE_BACKEND || 'supabase' }},SUPABASE_URL=${{ secrets.SUPABASE_URL || vars.VITE_SUPABASE_URL }},DEFAULT_STORAGE_BUCKET=${{ vars.DEFAULT_STORAGE_BUCKET || 'gameplay-videos' }},PLAYWRIGHT_HEADLESS=true,PLAYWRIGHT_NAV_TIMEOUT_MS=30000,WEBHOOK_TIMEOUT_MS=10000,MAX_RUN_TIMEOUT_MS=120000,RUN_CONCURRENCY_LIMIT=2"
+          if [ -n "${PUBLIC_APP_URL_VAR:-}" ]; then
+            SET_ENV="${SET_ENV},PUBLIC_APP_URL=${PUBLIC_APP_URL_VAR}"
+          fi
+          SET_ENV="${SET_ENV}${EXTRA_ENV}"
           # Cloud Run : une variable ne peut pas passer de Secret Manager → littéral dans le même `deploy`.
-          # On retire d’abord tous les secrets sur la révision (no-op s’il n’y en a plus), puis on déploie.
           if gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" &>/dev/null; then
             gcloud run services update "${SERVICE_NAME}" \
               --project "${PROJECT_ID}" \
@@ -95,4 +102,11 @@ jobs:
             --platform managed \
             --allow-unauthenticated \
             --port 8080 \
-            --set-env-vars "NODE_ENV=production,LOG_LEVEL=info,FRONTEND_DIST_PATH=/app/frontend-dist,BODY_LIMIT_BYTES=5242880,STORAGE_BACKEND=${{ vars.STORAGE_BACKEND || 'supabase' }},SUPABASE_URL=${{ secrets.SUPABASE_URL || vars.VITE_SUPABASE_URL }},SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }},DEFAULT_STORAGE_BUCKET=${{ vars.DEFAULT_STORAGE_BUCKET || 'gameplay-videos' }},PUBLIC_APP_URL=${{ vars.PUBLIC_APP_URL }},PLAYWRIGHT_HEADLESS=true,PLAYWRIGHT_NAV_TIMEOUT_MS=30000,WEBHOOK_TIMEOUT_MS=10000,MAX_RUN_TIMEOUT_MS=120000,RUN_CONCURRENCY_LIMIT=2${EXTRA_ENV}"
+            --cpu-boost \
+            --memory=1Gi \
+            --env-vars-file=/tmp/cloudrun-role.yaml \
+            --set-env-vars "${SET_ENV}"
+          RUN_URL="$(gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" --format='value(status.url)')"
+          echo ""
+          echo "::notice::URL Cloud Run : ${RUN_URL} — mets-la dans GitHub → Settings → Variables → PUBLIC_APP_URL (sans slash final), puis relance le workflow pour activer le webhook bot."
+          echo "$RUN_URL"

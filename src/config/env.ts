@@ -20,10 +20,19 @@ const envSchema = z
       z.string().min(1).optional()
     ),
     /** Optionnel : uniquement pour `npm run db:migrate` en local (script pg). */
-    DATABASE_URL: z.string().min(1).optional(),
-    GEMINI_API_KEY: z.string().min(1).optional(),
+    DATABASE_URL: z.preprocess(
+      (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+      z.string().min(1).optional()
+    ),
+    GEMINI_API_KEY: z.preprocess(
+      (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+      z.string().min(1).optional()
+    ),
     /** URL publique du service Cloud Run (webhook bot), sans slash final */
-    PUBLIC_APP_URL: z.string().url().optional(),
+    PUBLIC_APP_URL: z.preprocess(
+      (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+      z.string().url().optional()
+    ),
     PLAYWRIGHT_HEADLESS: z
       .string()
       .optional()
@@ -35,7 +44,10 @@ const envSchema = z
     RUN_CONCURRENCY_LIMIT: z.coerce.number().int().positive().default(2),
     DEFAULT_STORAGE_BUCKET: z.string().min(1).default("gameplay-videos"),
     /** Chemin vers le build statique du frontend (optionnel, prod) */
-    FRONTEND_DIST_PATH: z.string().min(1).optional()
+    FRONTEND_DIST_PATH: z.preprocess(
+      (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+      z.string().min(1).optional()
+    )
   })
   .superRefine((data, ctx) => {
     if (data.STORAGE_BACKEND === "supabase") {
