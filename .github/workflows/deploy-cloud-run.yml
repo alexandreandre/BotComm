@@ -6,27 +6,26 @@ on:
       - main
 
 env:
-  SERVICE_NAME: ${{ vars.CLOUD_RUN_SERVICE || 'cinecontent-bot-dispatcher' }}
-  REGION: ${{ vars.GCP_REGION }}
+  SERVICE_NAME: ${{ vars.CLOUD_RUN_SERVICE || vars.BACKEND_SERVICE_NAME || 'cinecontent-bot-dispatcher' }}
+  REGION: ${{ vars.GCP_REGION || 'europe-west1' }}
   PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-  ARTIFACT_REPO: ${{ vars.ARTIFACT_REPO }}
+  ARTIFACT_REPO: ${{ vars.ARTIFACT_REPO || 'cloud-run-images' }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Clé JSON du compte de service (secret GCP_SA_KEY)
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
@@ -37,8 +36,18 @@ jobs:
       - name: Build and Push Image
         env:
           IMAGE_URI: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+          # Secrets GitHub OU variables (ex. VITE_SUPABASE_PUBLISHABLE_KEY = ancienne clé anon)
+          VITE_SUPABASE_URL: ${{ secrets.SUPABASE_URL || vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY || vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
         run: |
-          docker build -t "${IMAGE_URI}" .
+          if [ -z "$VITE_SUPABASE_URL" ] || [ -z "$VITE_SUPABASE_ANON_KEY" ]; then
+            echo "Définis SUPABASE_URL + SUPABASE_ANON_KEY (secrets) ou VITE_SUPABASE_URL + VITE_SUPABASE_PUBLISHABLE_KEY (variables)."
+            exit 1
+          fi
+          docker build -t "${IMAGE_URI}" \
+            --build-arg "VITE_SUPABASE_URL=${VITE_SUPABASE_URL}" \
+            --build-arg "VITE_SUPABASE_ANON_KEY=${VITE_SUPABASE_ANON_KEY}" \
+            .
           docker push "${IMAGE_URI}"
           echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
 
@@ -51,5 +60,5 @@ jobs:
             --platform managed \
             --allow-unauthenticated \
             --port 8080 \
-            --set-env-vars "NODE_ENV=production,LOG_LEVEL=info,SUPABASE_URL=${{ secrets.SUPABASE_URL }},DEFAULT_STORAGE_BUCKET=${{ vars.DEFAULT_STORAGE_BUCKET || 'gameplay-videos' }},PLAYWRIGHT_HEADLESS=true,PLAYWRIGHT_NAV_TIMEOUT_MS=30000,WEBHOOK_TIMEOUT_MS=10000,MAX_RUN_TIMEOUT_MS=120000,RUN_CONCURRENCY_LIMIT=2" \
+            --set-env-vars "NODE_ENV=production,LOG_LEVEL=info,FRONTEND_DIST_PATH=/app/frontend-dist,BODY_LIMIT_BYTES=5242880,STORAGE_BACKEND=${{ vars.STORAGE_BACKEND || 'supabase' }},SUPABASE_URL=${{ secrets.SUPABASE_URL }},DEFAULT_STORAGE_BUCKET=${{ vars.DEFAULT_STORAGE_BUCKET || 'gameplay-videos' }},GCS_BUCKET=${{ vars.GCS_BUCKET }},PUBLIC_APP_URL=${{ vars.PUBLIC_APP_URL }},DATABASE_SSL=auto,PLAYWRIGHT_HEADLESS=true,PLAYWRIGHT_NAV_TIMEOUT_MS=30000,WEBHOOK_TIMEOUT_MS=10000,MAX_RUN_TIMEOUT_MS=120000,RUN_CONCURRENCY_LIMIT=2" \
             --set-secrets "SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SERVICE_ROLE_KEY:latest"
