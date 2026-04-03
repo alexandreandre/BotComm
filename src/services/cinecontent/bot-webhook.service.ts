@@ -1,6 +1,6 @@
 import { z } from "zod";
-import type { PoolClient } from "pg";
 import { insertActivityLog } from "../../api/activity-log";
+import { getSupabaseAdmin } from "../../api/supabase-auth";
 import { env } from "../../config/env";
 import { generateCaptionsWithGemini } from "../gemini.service";
 import type { StorageService } from "../storage.service";
@@ -56,41 +56,78 @@ function storageBucketForPublicUrl(): string {
   return env.DEFAULT_STORAGE_BUCKET;
 }
 
+type RunWithStrategy = {
+  user_id: string;
+  strategy_id: string;
+  game: string;
+  bot_goal: string | null;
+  content_strategies: {
+    caption_style: string;
+    platforms: string[] | null;
+    game: string;
+  } | null;
+};
+
 export async function processBotWebhook(
   body: BotWebhookBody,
-  client: PoolClient,
   storageService: StorageService
 ): Promise<{ success: boolean; run_id: string; clip_id?: string; status: string }> {
-  const runRes = await client.query(
-    `SELECT r.*, s.caption_style::text AS caption_style, s.platforms, s.game AS strategy_game
-     FROM runs r
-     JOIN content_strategies s ON s.id = r.strategy_id
-     WHERE r.id = $1 AND r.bot_callback_token = $2 AND r.status = 'running'::run_status`,
-    [body.run_id, body.callback_token]
-  );
+  const sb = getSupabaseAdmin();
 
-  if (!runRes.rowCount) {
+  const { data: run, error: fetchErr } = await sb
+    .from("runs")
+    .select(
+      `
+      user_id,
+      strategy_id,
+      game,
+      bot_goal,
+      content_strategies (
+        caption_style,
+        platforms,
+        game
+      )
+    `
+    )
+    .eq("id", body.run_id)
+    .eq("bot_callback_token", body.callback_token)
+    .eq("status", "running")
+    .maybeSingle();
+
+  if (fetchErr) {
+    throw fetchErr;
+  }
+
+  if (!run) {
     return { success: false, run_id: body.run_id, status: "invalid_token" };
   }
 
-  const run = runRes.rows[0] as Record<string, unknown>;
-  const userId = run["user_id"] as string;
+  const row = run as unknown as RunWithStrategy;
+  const userId = row.user_id;
+  const strat = row.content_strategies;
 
   if (body.status === "failed") {
-    const upd = await client.query(
-      `UPDATE runs SET
-        status = 'failed'::run_status,
-        summary = $2,
-        completed_at = now(),
-        bot_callback_token = NULL,
-        updated_at = now()
-       WHERE id = $1 AND bot_callback_token = $3 AND status = 'running'::run_status`,
-      [body.run_id, body.error_message, body.callback_token]
-    );
-    if (!upd.rowCount) {
+    const { data: updRows, error: updErr } = await sb
+      .from("runs")
+      .update({
+        status: "failed",
+        summary: body.error_message,
+        completed_at: new Date().toISOString(),
+        bot_callback_token: null
+      })
+      .eq("id", body.run_id)
+      .eq("bot_callback_token", body.callback_token)
+      .eq("status", "running")
+      .select("id");
+
+    if (updErr) {
+      throw updErr;
+    }
+    if (!updRows?.length) {
       return { success: false, run_id: body.run_id, status: "invalid_token" };
     }
-    await insertActivityLog(client, {
+
+    await insertActivityLog({
       userId,
       level: "error",
       category: "run",
@@ -105,9 +142,9 @@ export async function processBotWebhook(
   const rawVideoUrl = storageService.publicUrlForPath(bucket, body.video_path);
 
   const vScore = viralScore(body.score, body.streak);
-  const captionStyle = (run["caption_style"] as string) ?? "punchy";
-  const gameName = (run["game"] as string) || (run["strategy_game"] as string) || "Jeu";
-  const botGoal = (run["bot_goal"] as string) ?? "";
+  const captionStyle = strat?.caption_style ?? "punchy";
+  const gameName = row.game || strat?.game || "Jeu";
+  const botGoal = row.bot_goal ?? "";
 
   const captions = await generateCaptionsWithGemini({
     game: gameName,
@@ -123,75 +160,79 @@ export async function processBotWebhook(
     hashtags.push("viral");
   }
 
-  const platforms = run["platforms"] as string[] | null;
+  const platforms = strat?.platforms;
   const platform = platforms?.[0] === "instagram" ? "instagram" : "tiktok";
 
-  await client.query("BEGIN");
-  try {
-    const runUpd = await client.query(
-      `UPDATE runs SET
-        status = 'completed'::run_status,
-        score = $2,
-        streak = $3,
-        duration = $4,
-        viral_score = $5,
-        raw_video_url = $6,
-        completed_at = now(),
-        bot_callback_token = NULL,
-        updated_at = now()
-       WHERE id = $1 AND bot_callback_token = $7 AND status = 'running'::run_status`,
-      [body.run_id, body.score, body.streak, body.duration, vScore, rawVideoUrl, body.callback_token]
-    );
-    if (!runUpd.rowCount) {
-      await client.query("ROLLBACK");
-      return { success: false, run_id: body.run_id, status: "invalid_token" };
-    }
+  const { data: runUpd, error: runUpdErr } = await sb
+    .from("runs")
+    .update({
+      status: "completed",
+      score: body.score,
+      streak: body.streak,
+      duration: body.duration,
+      viral_score: vScore,
+      raw_video_url: rawVideoUrl,
+      completed_at: new Date().toISOString(),
+      bot_callback_token: null
+    })
+    .eq("id", body.run_id)
+    .eq("bot_callback_token", body.callback_token)
+    .eq("status", "running")
+    .select("id");
 
-    for (const ev of body.events) {
-      await client.query(
-        `INSERT INTO run_events (run_id, event_type, description, data)
-         VALUES ($1, $2, $3, $4::jsonb)`,
-        [body.run_id, ev.event_type, ev.description ?? "", JSON.stringify(ev.data ?? {})]
-      );
-    }
-
-    const clipRes = await client.query(
-      `INSERT INTO clips (
-        user_id, run_id, strategy_id, game, platform, status,
-        caption, hashtags, first_comment, duration, video_url
-      ) VALUES (
-        $1, $2, $3, $4, $5::platform, 'ready_for_approval'::clip_status,
-        $6, $7::text[], $8, $9, $10
-      ) RETURNING id`,
-      [
-        userId,
-        body.run_id,
-        run["strategy_id"],
-        gameName,
-        platform,
-        captions.caption,
-        hashtags,
-        captions.first_comment,
-        body.duration,
-        rawVideoUrl
-      ]
-    );
-
-    const clipId = (clipRes.rows[0] as { id: string }).id;
-
-    await insertActivityLog(client, {
-      userId,
-      level: "success",
-      category: "caption",
-      message: "Run terminé, clip prêt pour review",
-      entityId: clipId,
-      entityType: "clip"
-    });
-
-    await client.query("COMMIT");
-    return { success: true, run_id: body.run_id, clip_id: clipId, status: "completed" };
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
+  if (runUpdErr) {
+    throw runUpdErr;
   }
+  if (!runUpd?.length) {
+    return { success: false, run_id: body.run_id, status: "invalid_token" };
+  }
+
+  if (body.events.length > 0) {
+    const { error: evErr } = await sb.from("run_events").insert(
+      body.events.map((ev) => ({
+        run_id: body.run_id,
+        event_type: ev.event_type,
+        description: ev.description ?? "",
+        data: ev.data ?? {}
+      }))
+    );
+    if (evErr) {
+      throw evErr;
+    }
+  }
+
+  const { data: clipRow, error: clipErr } = await sb
+    .from("clips")
+    .insert({
+      user_id: userId,
+      run_id: body.run_id,
+      strategy_id: row.strategy_id,
+      game: gameName,
+      platform,
+      status: "ready_for_approval",
+      caption: captions.caption,
+      hashtags,
+      first_comment: captions.first_comment,
+      duration: body.duration,
+      video_url: rawVideoUrl
+    })
+    .select("id")
+    .single();
+
+  if (clipErr || !clipRow) {
+    throw clipErr ?? new Error("Insert clip failed");
+  }
+
+  const clipId = clipRow.id as string;
+
+  await insertActivityLog({
+    userId,
+    level: "success",
+    category: "caption",
+    message: "Run terminé, clip prêt pour review",
+    entityId: clipId,
+    entityType: "clip"
+  });
+
+  return { success: true, run_id: body.run_id, clip_id: clipId, status: "completed" };
 }

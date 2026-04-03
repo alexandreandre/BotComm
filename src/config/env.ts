@@ -19,12 +19,8 @@ const envSchema = z
       (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
       z.string().min(1).optional()
     ),
+    /** Optionnel : uniquement pour `npm run db:migrate` en local (script pg). */
     DATABASE_URL: z.string().min(1).optional(),
-    /**
-     * SSL pour pg : auto = activer si l’hôte ressemble à Supabase (recommandé en prod).
-     * Désactiver explicitement en local si besoin : DATABASE_SSL=false
-     */
-    DATABASE_SSL: z.enum(["auto", "true", "false"]).default("auto"),
     GEMINI_API_KEY: z.string().min(1).optional(),
     /** URL publique du service Cloud Run (webhook bot), sans slash final */
     PUBLIC_APP_URL: z.string().url().optional(),
@@ -58,13 +54,6 @@ const envSchema = z
         ctx.addIssue({ code: "custom", message: "GCS_BUCKET requis si STORAGE_BACKEND=gcs" });
       }
     }
-    if (data.DATABASE_URL && (!data.SUPABASE_URL || !data.SUPABASE_SERVICE_ROLE_KEY)) {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY requis avec DATABASE_URL (auth JWT Supabase pour /api/*)"
-      });
-    }
   });
 
 const parsed = envSchema.safeParse(process.env);
@@ -74,13 +63,6 @@ if (!parsed.success) {
 }
 
 export const env = parsed.data;
-
-export function requireDatabaseUrl(): string {
-  if (!env.DATABASE_URL) {
-    throw new Error("DATABASE_URL non configuré");
-  }
-  return env.DATABASE_URL;
-}
 
 export function requirePublicAppUrl(): string {
   if (!env.PUBLIC_APP_URL) {

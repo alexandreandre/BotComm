@@ -3,7 +3,8 @@ import { env } from "../config/env";
 
 let adminClient: SupabaseClient | null = null;
 
-function getSupabaseAdmin(): SupabaseClient {
+/** Client service_role : accès PostgREST complet (serveur uniquement). */
+export function getSupabaseAdmin(): SupabaseClient {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY requis pour l’API");
   }

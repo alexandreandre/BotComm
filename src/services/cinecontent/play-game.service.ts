@@ -1,52 +1,59 @@
 import { randomUUID } from "node:crypto";
-import type { PoolClient } from "pg";
 import { insertActivityLog } from "../../api/activity-log";
+import { getSupabaseAdmin } from "../../api/supabase-auth";
 import { env, requirePublicAppUrl } from "../../config/env";
 import { AppError } from "../../core/errors";
 import type { DispatchRunService } from "../dispatch-run.service";
 import type { StorageService } from "../storage.service";
 
 export async function playGameForUser(
-  client: PoolClient,
   userId: string,
   strategyId: string,
   dispatchRunService: DispatchRunService,
   _storageService: StorageService
 ): Promise<{ run: Record<string, unknown>; bot_dispatched: boolean; message: string }> {
-  const sRes = await client.query(
-    `SELECT * FROM content_strategies WHERE id = $1 AND user_id = $2`,
-    [strategyId, userId]
-  );
-  if (sRes.rowCount === 0) {
+  const sb = getSupabaseAdmin();
+  const { data: strategy, error: sErr } = await sb
+    .from("content_strategies")
+    .select("*")
+    .eq("id", strategyId)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (sErr) {
+    throw sErr;
+  }
+  if (!strategy) {
     throw new AppError("Stratégie introuvable", { code: "NOT_FOUND", statusCode: 404 });
   }
-  const strategy = sRes.rows[0] as Record<string, unknown>;
-  const gameUrl = (strategy["game_url"] as string)?.trim();
+
+  const gameUrl = String(strategy.game_url ?? "").trim();
   if (!gameUrl) {
     throw new AppError("game_url requis sur la stratégie", { code: "VALIDATION", statusCode: 400 });
   }
 
   const token = randomUUID();
-  const runInsert = await client.query(
-    `INSERT INTO runs (
-      user_id, strategy_id, game, theme, bot_goal, status, bot_callback_token
-    ) VALUES (
-      $1, $2, $3, $4, $5, 'pending'::run_status, $6
-    ) RETURNING *`,
-    [
-      userId,
-      strategyId,
-      strategy["game"] as string,
-      (strategy["theme"] as string) ?? "",
-      (strategy["bot_goal"] as string) ?? "",
-      token
-    ]
-  );
+  const { data: run, error: insErr } = await sb
+    .from("runs")
+    .insert({
+      user_id: userId,
+      strategy_id: strategyId,
+      game: strategy.game as string,
+      theme: (strategy.theme as string) ?? "",
+      bot_goal: (strategy.bot_goal as string) ?? "",
+      status: "pending",
+      bot_callback_token: token
+    })
+    .select()
+    .single();
 
-  const run = runInsert.rows[0] as Record<string, unknown>;
-  const runId = run["id"] as string;
+  if (insErr || !run) {
+    throw insErr ?? new Error("Insert run failed");
+  }
 
-  await insertActivityLog(client, {
+  const runId = run.id as string;
+
+  await insertActivityLog({
     userId,
     level: "info",
     category: "run",
@@ -60,7 +67,7 @@ export async function playGameForUser(
   const storagePath = `${userId}/${runId}`;
   const maxDuration = Math.min(
     Math.floor(env.MAX_RUN_TIMEOUT_MS / 1000),
-    Math.max(30, Number(strategy["target_clip_duration"] ?? 60))
+    Math.max(30, Number(strategy.target_clip_duration ?? 60))
   );
 
   const storageBucket =
@@ -75,8 +82,8 @@ export async function playGameForUser(
       callback_token: token,
       webhook_url: webhookUrl,
       game_url: gameUrl,
-      game: String(strategy["game"]),
-      bot_goal: String(strategy["bot_goal"] ?? ""),
+      game: String(strategy.game),
+      bot_goal: String(strategy.bot_goal ?? ""),
       max_duration_seconds: maxDuration,
       storage_bucket: storageBucket,
       storage_path: storagePath
@@ -84,11 +91,11 @@ export async function playGameForUser(
     botDispatched = true;
   } catch (e) {
     if (e instanceof AppError && e.code === "RUN_LIMIT") {
-      await client.query(
-        `UPDATE runs SET status = 'failed'::run_status, summary = $2, updated_at = now() WHERE id = $1`,
-        [runId, "Limite de concurrence bot atteinte"]
-      );
-      await insertActivityLog(client, {
+      await sb
+        .from("runs")
+        .update({ status: "failed", summary: "Limite de concurrence bot atteinte" })
+        .eq("id", runId);
+      await insertActivityLog({
         userId,
         level: "error",
         category: "run",
@@ -102,21 +109,21 @@ export async function playGameForUser(
         message: e.message
       };
     }
-    await client.query(
-      `UPDATE runs SET status = 'failed'::run_status, summary = $2, updated_at = now() WHERE id = $1`,
-      [runId, e instanceof Error ? e.message : "Erreur dispatch"]
-    );
+    await sb
+      .from("runs")
+      .update({ status: "failed", summary: e instanceof Error ? e.message : "Erreur dispatch" })
+      .eq("id", runId);
     throw e;
   }
 
-  await client.query(
-    `UPDATE runs SET status = 'running'::run_status, updated_at = now() WHERE id = $1`,
-    [runId]
-  );
+  const { data: updated, error: upErr } = await sb.from("runs").update({ status: "running" }).eq("id", runId).select().single();
 
-  const updated = await client.query(`SELECT * FROM runs WHERE id = $1`, [runId]);
+  if (upErr || !updated) {
+    throw upErr ?? new Error("Update run failed");
+  }
+
   return {
-    run: updated.rows[0] as Record<string, unknown>,
+    run: updated as Record<string, unknown>,
     bot_dispatched: botDispatched,
     message
   };

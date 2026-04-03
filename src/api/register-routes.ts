@@ -1,9 +1,8 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
-import { verifySupabaseUserJwt } from "./supabase-auth";
+import { getSupabaseAdmin, verifySupabaseUserJwt } from "./supabase-auth";
 import { env } from "../config/env";
 import { AppError } from "../core/errors";
-import { withClient } from "../db/pool";
 import type { DispatchRunService } from "../services/dispatch-run.service";
 import { generateStrategyWithGemini } from "../services/gemini.service";
 import type { StorageService } from "../services/storage.service";
@@ -58,8 +57,14 @@ export type CinecontentRouteDeps = {
   storageService: StorageService;
 };
 
+function apiDataReady(): boolean {
+  return Boolean(env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY);
+}
+
 function apiDisabled(reply: { status: (c: number) => { send: (b: unknown) => void } }): void {
-  reply.status(503).send({ ok: false, error: "API CineContent désactivée (DATABASE_URL manquant)" });
+  reply
+    .status(503)
+    .send({ ok: false, error: "API CineContent désactivée (SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY manquant)" });
 }
 
 async function requireSupabaseAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
@@ -85,19 +90,17 @@ export async function registerCinecontentRoutes(
   deps: CinecontentRouteDeps
 ): Promise<void> {
   app.post("/api/webhooks/bot", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const body = botWebhookBodySchema.parse(request.body);
-    await withClient(async (client) => {
-      const result = await processBotWebhook(body, client, deps.storageService);
-      if (!result.success && result.status === "invalid_token") {
-        reply.status(401).send({ ok: false, ...result });
-        return;
-      }
-      reply.status(200).send({ ok: true, ...result });
-    });
+    const result = await processBotWebhook(body, deps.storageService);
+    if (!result.success && result.status === "invalid_token") {
+      reply.status(401).send({ ok: false, ...result });
+      return;
+    }
+    reply.status(200).send({ ok: true, ...result });
   });
 
   app.addHook("preHandler", async (request, reply) => {
@@ -115,635 +118,669 @@ export async function registerCinecontentRoutes(
   });
 
   app.get("/api/me", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const email = request.supabaseUser!.email ?? "";
-    await withClient(async (client) => {
-      await client.query(
-        `INSERT INTO profiles (user_id, display_name) VALUES ($1, $2)
-         ON CONFLICT (user_id) DO NOTHING`,
-        [uid, email]
-      );
-      const r = await client.query(`SELECT * FROM profiles WHERE user_id = $1`, [uid]);
-      reply.send({ ok: true, profile: r.rows[0], email });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: existing } = await sb.from("profiles").select("id").eq("user_id", uid).maybeSingle();
+    if (!existing) {
+      const { error: insErr } = await sb.from("profiles").insert({ user_id: uid, display_name: email });
+      if (insErr && !String(insErr.message).includes("duplicate")) {
+        throw insErr;
+      }
+    }
+    const { data: profile, error } = await sb.from("profiles").select("*").eq("user_id", uid).maybeSingle();
+    if (error) {
+      throw error;
+    }
+    reply.send({ ok: true, profile, email });
   });
 
   app.patch("/api/me", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const body = z.object({ display_name: z.string().min(1).max(200).optional() }).parse(request.body);
-    await withClient(async (client) => {
-      if (body.display_name) {
-        await client.query(
-          `INSERT INTO profiles (user_id, display_name) VALUES ($1, $2)
-           ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = now()`,
-          [uid, body.display_name]
-        );
+    const sb = getSupabaseAdmin();
+    if (body.display_name) {
+      const { error: upErr } = await sb.from("profiles").upsert(
+        { user_id: uid, display_name: body.display_name },
+        { onConflict: "user_id" }
+      );
+      if (upErr) {
+        throw upErr;
       }
-      const r = await client.query(`SELECT * FROM profiles WHERE user_id = $1`, [uid]);
-      reply.send({ ok: true, profile: r.rows[0] });
-    });
+    }
+    const { data: profile, error } = await sb.from("profiles").select("*").eq("user_id", uid).maybeSingle();
+    if (error) {
+      throw error;
+    }
+    reply.send({ ok: true, profile });
   });
 
   app.get("/api/strategies", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
-    await withClient(async (client) => {
-      const r = await client.query(
-        `SELECT s.*, (SELECT COUNT(*)::int FROM runs r WHERE r.strategy_id = s.id) AS run_count
-         FROM content_strategies s WHERE s.user_id = $1 ORDER BY s.updated_at DESC`,
-        [uid]
-      );
-      reply.send({ ok: true, strategies: r.rows });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: strategies, error: e1 } = await sb
+      .from("content_strategies")
+      .select("*")
+      .eq("user_id", uid)
+      .order("updated_at", { ascending: false });
+    if (e1) {
+      throw e1;
+    }
+    const { data: runs, error: e2 } = await sb.from("runs").select("strategy_id").eq("user_id", uid);
+    if (e2) {
+      throw e2;
+    }
+    const counts = new Map<string, number>();
+    for (const r of runs ?? []) {
+      const sid = r.strategy_id as string;
+      counts.set(sid, (counts.get(sid) ?? 0) + 1);
+    }
+    const rows = (strategies ?? []).map((s) => ({
+      ...s,
+      run_count: counts.get(s.id as string) ?? 0
+    }));
+    reply.send({ ok: true, strategies: rows });
   });
 
   app.post("/api/strategies", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const body = strategyCreateSchema.parse(request.body);
-    await withClient(async (client) => {
-      const r = await client.query(
-        `INSERT INTO content_strategies (
-          user_id, name, game, game_url, theme, bot_goal, content_angle, hook_template,
-          caption_style, platforms, target_clip_duration, runs_to_launch, status
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8,
-          $9::caption_style, $10::platform[], $11, $12, $13::strategy_status
-        ) RETURNING *`,
-        [
-          uid,
-          body.name,
-          body.game,
-          body.game_url,
-          body.theme,
-          body.bot_goal,
-          body.content_angle,
-          body.hook_template,
-          body.caption_style,
-          body.platforms,
-          body.target_clip_duration,
-          body.runs_to_launch,
-          body.status
-        ]
-      );
-      reply.status(201).send({ ok: true, strategy: r.rows[0] });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: row, error } = await sb
+      .from("content_strategies")
+      .insert({
+        user_id: uid,
+        name: body.name,
+        game: body.game,
+        game_url: body.game_url,
+        theme: body.theme,
+        bot_goal: body.bot_goal,
+        content_angle: body.content_angle,
+        hook_template: body.hook_template,
+        caption_style: body.caption_style,
+        platforms: body.platforms,
+        target_clip_duration: body.target_clip_duration,
+        runs_to_launch: body.runs_to_launch,
+        status: body.status
+      })
+      .select()
+      .single();
+    if (error) {
+      throw error;
+    }
+    reply.status(201).send({ ok: true, strategy: row });
   });
 
   app.get("/api/strategies/:id", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
-    await withClient(async (client) => {
-      const r = await client.query(`SELECT * FROM content_strategies WHERE id = $1 AND user_id = $2`, [
-        id,
-        uid
-      ]);
-      if (!r.rowCount) {
-        reply.status(404).send({ ok: false, error: "Introuvable" });
-        return;
-      }
-      reply.send({ ok: true, strategy: r.rows[0] });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: row, error } = await sb
+      .from("content_strategies")
+      .select("*")
+      .eq("id", id)
+      .eq("user_id", uid)
+      .maybeSingle();
+    if (error) {
+      throw error;
+    }
+    if (!row) {
+      reply.status(404).send({ ok: false, error: "Introuvable" });
+      return;
+    }
+    reply.send({ ok: true, strategy: row });
   });
 
   app.patch("/api/strategies/:id", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
     const body = strategyPatchSchema.parse(request.body);
-    const fields: string[] = [];
-    const values: unknown[] = [];
-    let i = 1;
-    if (body.name !== undefined) {
-      fields.push(`name = $${i}`);
-      values.push(body.name);
-      i += 1;
-    }
-    if (body.game !== undefined) {
-      fields.push(`game = $${i}`);
-      values.push(body.game);
-      i += 1;
-    }
-    if (body.game_url !== undefined) {
-      fields.push(`game_url = $${i}`);
-      values.push(body.game_url);
-      i += 1;
-    }
-    if (body.theme !== undefined) {
-      fields.push(`theme = $${i}`);
-      values.push(body.theme);
-      i += 1;
-    }
-    if (body.bot_goal !== undefined) {
-      fields.push(`bot_goal = $${i}`);
-      values.push(body.bot_goal);
-      i += 1;
-    }
-    if (body.content_angle !== undefined) {
-      fields.push(`content_angle = $${i}`);
-      values.push(body.content_angle);
-      i += 1;
-    }
-    if (body.hook_template !== undefined) {
-      fields.push(`hook_template = $${i}`);
-      values.push(body.hook_template);
-      i += 1;
-    }
-    if (body.caption_style !== undefined) {
-      fields.push(`caption_style = $${i}::caption_style`);
-      values.push(body.caption_style);
-      i += 1;
-    }
-    if (body.platforms !== undefined) {
-      fields.push(`platforms = $${i}::platform[]`);
-      values.push(body.platforms);
-      i += 1;
-    }
-    if (body.target_clip_duration !== undefined) {
-      fields.push(`target_clip_duration = $${i}`);
-      values.push(body.target_clip_duration);
-      i += 1;
-    }
-    if (body.runs_to_launch !== undefined) {
-      fields.push(`runs_to_launch = $${i}`);
-      values.push(body.runs_to_launch);
-      i += 1;
-    }
-    if (body.status !== undefined) {
-      fields.push(`status = $${i}::strategy_status`);
-      values.push(body.status);
-      i += 1;
-    }
-    if (fields.length === 0) {
+    const patch: Record<string, unknown> = {};
+    if (body.name !== undefined) patch.name = body.name;
+    if (body.game !== undefined) patch.game = body.game;
+    if (body.game_url !== undefined) patch.game_url = body.game_url;
+    if (body.theme !== undefined) patch.theme = body.theme;
+    if (body.bot_goal !== undefined) patch.bot_goal = body.bot_goal;
+    if (body.content_angle !== undefined) patch.content_angle = body.content_angle;
+    if (body.hook_template !== undefined) patch.hook_template = body.hook_template;
+    if (body.caption_style !== undefined) patch.caption_style = body.caption_style;
+    if (body.platforms !== undefined) patch.platforms = body.platforms;
+    if (body.target_clip_duration !== undefined) patch.target_clip_duration = body.target_clip_duration;
+    if (body.runs_to_launch !== undefined) patch.runs_to_launch = body.runs_to_launch;
+    if (body.status !== undefined) patch.status = body.status;
+    if (Object.keys(patch).length === 0) {
       reply.status(400).send({ ok: false, error: "Aucun champ à mettre à jour" });
       return;
     }
-    values.push(id, uid);
-    await withClient(async (client) => {
-      const r = await client.query(
-        `UPDATE content_strategies SET ${fields.join(", ")}, updated_at = now()
-         WHERE id = $${i} AND user_id = $${i + 1} RETURNING *`,
-        values
-      );
-      if (!r.rowCount) {
-        reply.status(404).send({ ok: false, error: "Introuvable" });
-        return;
-      }
-      reply.send({ ok: true, strategy: r.rows[0] });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: row, error } = await sb
+      .from("content_strategies")
+      .update(patch)
+      .eq("id", id)
+      .eq("user_id", uid)
+      .select()
+      .maybeSingle();
+    if (error) {
+      throw error;
+    }
+    if (!row) {
+      reply.status(404).send({ ok: false, error: "Introuvable" });
+      return;
+    }
+    reply.send({ ok: true, strategy: row });
   });
 
   app.delete("/api/strategies/:id", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
-    await withClient(async (client) => {
-      const r = await client.query(`DELETE FROM content_strategies WHERE id = $1 AND user_id = $2`, [id, uid]);
-      if (!r.rowCount) {
-        reply.status(404).send({ ok: false, error: "Introuvable" });
-        return;
-      }
-      reply.send({ ok: true });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: delRows, error } = await sb
+      .from("content_strategies")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", uid)
+      .select("id");
+    if (error) {
+      throw error;
+    }
+    if (!delRows?.length) {
+      reply.status(404).send({ ok: false, error: "Introuvable" });
+      return;
+    }
+    reply.send({ ok: true });
   });
 
   app.post("/api/runs/play", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const body = z.object({ strategy_id: z.string().uuid() }).parse(request.body);
-    await withClient(async (client) => {
-      try {
-        const out = await playGameForUser(client, uid, body.strategy_id, deps.dispatchRunService, deps.storageService);
-        reply.send({ ok: true, ...out });
-      } catch (e) {
-        if (e instanceof AppError) {
-          reply.status(e.statusCode).send({ ok: false, error: e.message, code: e.code });
-          return;
-        }
-        throw e;
+    try {
+      const out = await playGameForUser(uid, body.strategy_id, deps.dispatchRunService, deps.storageService);
+      reply.send({ ok: true, ...out });
+    } catch (e) {
+      if (e instanceof AppError) {
+        reply.status(e.statusCode).send({ ok: false, error: e.message, code: e.code });
+        return;
       }
-    });
+      throw e;
+    }
   });
 
   app.get("/api/runs", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
-    await withClient(async (client) => {
-      const r = await client.query(
-        `SELECT r.*, s.name AS strategy_name
-         FROM runs r
-         JOIN content_strategies s ON s.id = r.strategy_id
-         WHERE r.user_id = $1
-         ORDER BY r.created_at DESC
-         LIMIT 200`,
-        [uid]
-      );
-      reply.send({ ok: true, runs: r.rows });
+    const sb = getSupabaseAdmin();
+    const { data: rows, error } = await sb
+      .from("runs")
+      .select("*, content_strategies(name)")
+      .eq("user_id", uid)
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (error) {
+      throw error;
+    }
+    const runs = (rows ?? []).map((r) => {
+      const cs = r.content_strategies as { name: string } | null;
+      const { content_strategies: _c, ...rest } = r as Record<string, unknown>;
+      return { ...rest, strategy_name: cs?.name ?? null };
     });
+    reply.send({ ok: true, runs });
   });
 
   app.get("/api/runs/:id", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
-    await withClient(async (client) => {
-      const r = await client.query(
-        `SELECT r.*, s.name AS strategy_name FROM runs r
-         JOIN content_strategies s ON s.id = r.strategy_id
-         WHERE r.id = $1 AND r.user_id = $2`,
-        [id, uid]
-      );
-      if (!r.rowCount) {
-        reply.status(404).send({ ok: false, error: "Introuvable" });
-        return;
-      }
-      reply.send({ ok: true, run: r.rows[0] });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: row, error } = await sb
+      .from("runs")
+      .select("*, content_strategies(name)")
+      .eq("id", id)
+      .eq("user_id", uid)
+      .maybeSingle();
+    if (error) {
+      throw error;
+    }
+    if (!row) {
+      reply.status(404).send({ ok: false, error: "Introuvable" });
+      return;
+    }
+    const cs = row.content_strategies as { name: string } | null;
+    const { content_strategies: _c, ...rest } = row as Record<string, unknown>;
+    reply.send({ ok: true, run: { ...rest, strategy_name: cs?.name ?? null } });
   });
 
   app.get("/api/runs/:id/events", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
-    await withClient(async (client) => {
-      const check = await client.query(`SELECT 1 FROM runs WHERE id = $1 AND user_id = $2`, [id, uid]);
-      if (!check.rowCount) {
-        reply.status(404).send({ ok: false, error: "Introuvable" });
-        return;
-      }
-      const r = await client.query(
-        `SELECT * FROM run_events WHERE run_id = $1 ORDER BY "timestamp" ASC`,
-        [id]
-      );
-      reply.send({ ok: true, events: r.rows });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: check, error: e1 } = await sb.from("runs").select("id").eq("id", id).eq("user_id", uid).maybeSingle();
+    if (e1) {
+      throw e1;
+    }
+    if (!check) {
+      reply.status(404).send({ ok: false, error: "Introuvable" });
+      return;
+    }
+    const { data: events, error: e2 } = await sb
+      .from("run_events")
+      .select("*")
+      .eq("run_id", id)
+      .order("timestamp", { ascending: true });
+    if (e2) {
+      throw e2;
+    }
+    reply.send({ ok: true, events: events ?? [] });
   });
 
   app.get("/api/clips", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
-    await withClient(async (client) => {
-      const r = await client.query(
-        `SELECT * FROM clips WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200`,
-        [uid]
-      );
-      reply.send({ ok: true, clips: r.rows });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: rows, error } = await sb
+      .from("clips")
+      .select("*")
+      .eq("user_id", uid)
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (error) {
+      throw error;
+    }
+    reply.send({ ok: true, clips: rows ?? [] });
   });
 
   app.get("/api/clips/review-queue", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
-    await withClient(async (client) => {
-      const r = await client.query(
-        `SELECT * FROM clips WHERE user_id = $1 AND status = 'ready_for_approval'::clip_status
-         ORDER BY created_at DESC`,
-        [uid]
-      );
-      reply.send({ ok: true, clips: r.rows });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: rows, error } = await sb
+      .from("clips")
+      .select("*")
+      .eq("user_id", uid)
+      .eq("status", "ready_for_approval")
+      .order("created_at", { ascending: false });
+    if (error) {
+      throw error;
+    }
+    reply.send({ ok: true, clips: rows ?? [] });
   });
 
   app.get("/api/clips/:id", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
-    await withClient(async (client) => {
-      const r = await client.query(`SELECT * FROM clips WHERE id = $1 AND user_id = $2`, [id, uid]);
-      if (!r.rowCount) {
-        reply.status(404).send({ ok: false, error: "Introuvable" });
-        return;
-      }
-      reply.send({ ok: true, clip: r.rows[0] });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: row, error } = await sb.from("clips").select("*").eq("id", id).eq("user_id", uid).maybeSingle();
+    if (error) {
+      throw error;
+    }
+    if (!row) {
+      reply.status(404).send({ ok: false, error: "Introuvable" });
+      return;
+    }
+    reply.send({ ok: true, clip: row });
   });
 
   app.patch("/api/clips/:id", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
     const body = clipPatchSchema.parse(request.body);
-    const fields: string[] = [];
-    const values: unknown[] = [];
-    let i = 1;
-    if (body.caption !== undefined) {
-      fields.push(`caption = $${i}`);
-      values.push(body.caption);
-      i += 1;
-    }
-    if (body.hashtags !== undefined) {
-      fields.push(`hashtags = $${i}::text[]`);
-      values.push(body.hashtags);
-      i += 1;
-    }
-    if (body.first_comment !== undefined) {
-      fields.push(`first_comment = $${i}`);
-      values.push(body.first_comment);
-      i += 1;
-    }
-    if (body.scheduled_at !== undefined) {
-      fields.push(`scheduled_at = $${i}::timestamptz`);
-      values.push(body.scheduled_at);
-      i += 1;
-    }
-    if (fields.length === 0) {
+    const patch: Record<string, unknown> = {};
+    if (body.caption !== undefined) patch.caption = body.caption;
+    if (body.hashtags !== undefined) patch.hashtags = body.hashtags;
+    if (body.first_comment !== undefined) patch.first_comment = body.first_comment;
+    if (body.scheduled_at !== undefined) patch.scheduled_at = body.scheduled_at;
+    if (Object.keys(patch).length === 0) {
       reply.status(400).send({ ok: false, error: "Aucun champ" });
       return;
     }
-    values.push(id, uid);
-    await withClient(async (client) => {
-      const r = await client.query(
-        `UPDATE clips SET ${fields.join(", ")}, updated_at = now()
-         WHERE id = $${i} AND user_id = $${i + 1} RETURNING *`,
-        values
-      );
-      if (!r.rowCount) {
-        reply.status(404).send({ ok: false, error: "Introuvable" });
-        return;
-      }
-      reply.send({ ok: true, clip: r.rows[0] });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: row, error } = await sb
+      .from("clips")
+      .update(patch)
+      .eq("id", id)
+      .eq("user_id", uid)
+      .select()
+      .maybeSingle();
+    if (error) {
+      throw error;
+    }
+    if (!row) {
+      reply.status(404).send({ ok: false, error: "Introuvable" });
+      return;
+    }
+    reply.send({ ok: true, clip: row });
   });
 
   app.post("/api/clips/:id/approve", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
-    await withClient(async (client) => {
-      await client.query("BEGIN");
-      try {
-        const c = await client.query(
-          `SELECT * FROM clips WHERE id = $1 AND user_id = $2 FOR UPDATE`,
-          [id, uid]
-        );
-        if (!c.rowCount) {
-          await client.query("ROLLBACK");
-          reply.status(404).send({ ok: false, error: "Introuvable" });
-          return;
-        }
-        const clip = c.rows[0] as Record<string, unknown>;
-        if (clip["status"] !== "ready_for_approval") {
-          await client.query("ROLLBACK");
-          reply.status(400).send({ ok: false, error: "Statut clip invalide" });
-          return;
-        }
-        await client.query(
-          `UPDATE clips SET status = 'approved'::clip_status, updated_at = now() WHERE id = $1`,
-          [id]
-        );
-        const pj = await client.query(
-          `INSERT INTO publish_jobs (user_id, clip_id, platform, status)
-           VALUES ($1, $2, $3::platform, 'pending'::publish_status) RETURNING *`,
-          [uid, id, clip["platform"]]
-        );
-        await insertActivityLog(client, {
-          userId: uid,
-          level: "success",
-          category: "approval",
-          message: "Clip approuvé",
-          entityId: id,
-          entityType: "clip"
-        });
-        await client.query("COMMIT");
-        reply.send({ ok: true, clip: { ...clip, status: "approved" }, publish_job: pj.rows[0] });
-      } catch (e) {
-        await client.query("ROLLBACK");
-        throw e;
-      }
+    const sb = getSupabaseAdmin();
+    const { data: clip, error: e1 } = await sb.from("clips").select("*").eq("id", id).eq("user_id", uid).maybeSingle();
+    if (e1) {
+      throw e1;
+    }
+    if (!clip) {
+      reply.status(404).send({ ok: false, error: "Introuvable" });
+      return;
+    }
+    if (clip.status !== "ready_for_approval") {
+      reply.status(400).send({ ok: false, error: "Statut clip invalide" });
+      return;
+    }
+    const { error: e2 } = await sb.from("clips").update({ status: "approved" }).eq("id", id);
+    if (e2) {
+      throw e2;
+    }
+    const { data: pj, error: e3 } = await sb
+      .from("publish_jobs")
+      .insert({
+        user_id: uid,
+        clip_id: id,
+        platform: clip.platform as string,
+        status: "pending"
+      })
+      .select()
+      .single();
+    if (e3 || !pj) {
+      throw e3 ?? new Error("publish_jobs insert failed");
+    }
+    await insertActivityLog({
+      userId: uid,
+      level: "success",
+      category: "approval",
+      message: "Clip approuvé",
+      entityId: id,
+      entityType: "clip"
     });
+    reply.send({ ok: true, clip: { ...clip, status: "approved" }, publish_job: pj });
   });
 
   app.post("/api/clips/:id/reject", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
-    await withClient(async (client) => {
-      const r = await client.query(
-        `UPDATE clips SET status = 'rejected'::clip_status, updated_at = now()
-         WHERE id = $1 AND user_id = $2 AND status = 'ready_for_approval'::clip_status
-         RETURNING *`,
-        [id, uid]
-      );
-      if (!r.rowCount) {
-        reply.status(400).send({ ok: false, error: "Rejet impossible" });
-        return;
-      }
-      await insertActivityLog(client, {
-        userId: uid,
-        level: "info",
-        category: "approval",
-        message: "Clip rejeté",
-        entityId: id,
-        entityType: "clip"
-      });
-      reply.send({ ok: true, clip: r.rows[0] });
+    const sb = getSupabaseAdmin();
+    const { data: row, error } = await sb
+      .from("clips")
+      .update({ status: "rejected" })
+      .eq("id", id)
+      .eq("user_id", uid)
+      .eq("status", "ready_for_approval")
+      .select()
+      .maybeSingle();
+    if (error) {
+      throw error;
+    }
+    if (!row) {
+      reply.status(400).send({ ok: false, error: "Rejet impossible" });
+      return;
+    }
+    await insertActivityLog({
+      userId: uid,
+      level: "info",
+      category: "approval",
+      message: "Clip rejeté",
+      entityId: id,
+      entityType: "clip"
     });
+    reply.send({ ok: true, clip: row });
   });
 
   app.post("/api/clips/:id/render", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
-    await withClient(async (client) => {
-      const c = await client.query(
-        `SELECT c.*, r.raw_video_url FROM clips c JOIN runs r ON r.id = c.run_id
-         WHERE c.id = $1 AND c.user_id = $2`,
-        [id, uid]
-      );
-      if (!c.rowCount) {
-        reply.status(404).send({ ok: false, error: "Introuvable" });
-        return;
-      }
-      const row = c.rows[0] as Record<string, unknown>;
-      await client.query(
-        `UPDATE clips SET status = 'rendering'::clip_status, updated_at = now() WHERE id = $1`,
-        [id]
-      );
-      const raw = row["raw_video_url"] as string | null;
-      await client.query(
-        `UPDATE clips SET status = 'rendered'::clip_status, video_url = COALESCE(video_url, $2), updated_at = now() WHERE id = $1`,
-        [id, raw]
-      );
-      const out = await client.query(`SELECT * FROM clips WHERE id = $1`, [id]);
-      reply.send({ ok: true, clip: out.rows[0], message: "Placeholder: copie vidéo brute" });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: joined, error: e1 } = await sb
+      .from("clips")
+      .select("*, runs(raw_video_url)")
+      .eq("id", id)
+      .eq("user_id", uid)
+      .maybeSingle();
+    if (e1) {
+      throw e1;
+    }
+    if (!joined) {
+      reply.status(404).send({ ok: false, error: "Introuvable" });
+      return;
+    }
+    const runsJoin = joined.runs as { raw_video_url: string | null } | null;
+    const raw = runsJoin?.raw_video_url ?? null;
+    const prevVideo = (joined as { video_url?: string | null }).video_url ?? null;
+    const { error: e2 } = await sb.from("clips").update({ status: "rendering" }).eq("id", id);
+    if (e2) {
+      throw e2;
+    }
+    const { error: e3 } = await sb
+      .from("clips")
+      .update({
+        status: "rendered",
+        video_url: prevVideo ?? raw
+      })
+      .eq("id", id);
+    if (e3) {
+      throw e3;
+    }
+    const { data: clip, error: e4 } = await sb.from("clips").select("*").eq("id", id).single();
+    if (e4 || !clip) {
+      throw e4 ?? new Error("clip fetch failed");
+    }
+    reply.send({ ok: true, clip, message: "Placeholder: copie vidéo brute" });
   });
 
   app.get("/api/publish-jobs", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const q = request.query as { clip_id?: string };
     const clipId = q.clip_id ? z.string().uuid().parse(q.clip_id) : undefined;
-    await withClient(async (client) => {
-      const r = clipId
-        ? await client.query(
-            `SELECT * FROM publish_jobs WHERE user_id = $1 AND clip_id = $2 ORDER BY created_at DESC`,
-            [uid, clipId]
-          )
-        : await client.query(
-            `SELECT * FROM publish_jobs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200`,
-            [uid]
-          );
-      reply.send({ ok: true, jobs: r.rows });
-    });
+    const sb = getSupabaseAdmin();
+    let qb = sb.from("publish_jobs").select("*").eq("user_id", uid).order("created_at", { ascending: false });
+    if (clipId) {
+      qb = qb.eq("clip_id", clipId);
+    } else {
+      qb = qb.limit(200);
+    }
+    const { data: rows, error } = await qb;
+    if (error) {
+      throw error;
+    }
+    reply.send({ ok: true, jobs: rows ?? [] });
   });
 
   app.post("/api/publish-jobs/:id/publish", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const id = z.string().uuid().parse((request.params as { id: string }).id);
-    await withClient(async (client) => {
-      const pj = await client.query(
-        `SELECT pj.*, c.caption, c.game, s.name AS strategy_name
-         FROM publish_jobs pj
-         JOIN clips c ON c.id = pj.clip_id
-         JOIN content_strategies s ON s.id = c.strategy_id
-         WHERE pj.id = $1 AND pj.user_id = $2`,
-        [id, uid]
-      );
-      if (!pj.rowCount) {
-        reply.status(404).send({ ok: false, error: "Introuvable" });
-        return;
-      }
-      const job = pj.rows[0] as Record<string, unknown>;
-      const st = job["status"] as string;
-      if (st !== "pending" && st !== "retry") {
-        reply.status(400).send({ ok: false, error: "Job non publiable" });
-        return;
-      }
-      const clipId = job["clip_id"] as string;
-      const clipCheck = await client.query(`SELECT status FROM clips WHERE id = $1`, [clipId]);
-      const clipStatus = (clipCheck.rows[0] as { status: string } | undefined)?.status;
-      if (clipStatus !== "approved") {
-        reply.status(400).send({ ok: false, error: "Clip non approuvé" });
-        return;
-      }
+    const sb = getSupabaseAdmin();
+    const { data: pjRow, error: e1 } = await sb
+      .from("publish_jobs")
+      .select(
+        `
+        *,
+        clips (
+          caption,
+          game,
+          status,
+          strategy_id,
+          content_strategies ( name )
+        )
+      `
+      )
+      .eq("id", id)
+      .eq("user_id", uid)
+      .maybeSingle();
+    if (e1) {
+      throw e1;
+    }
+    if (!pjRow) {
+      reply.status(404).send({ ok: false, error: "Introuvable" });
+      return;
+    }
+    const job = pjRow as Record<string, unknown>;
+    const st = job.status as string;
+    if (st !== "pending" && st !== "retry") {
+      reply.status(400).send({ ok: false, error: "Job non publiable" });
+      return;
+    }
+    const clipJoin = job.clips as {
+      caption: string;
+      game: string;
+      status: string;
+      strategy_id: string;
+      content_strategies: { name: string } | null;
+    } | null;
+    const clipId = job.clip_id as string;
+    const clipStatus = clipJoin?.status;
+    if (clipStatus !== "approved") {
+      reply.status(400).send({ ok: false, error: "Clip non approuvé" });
+      return;
+    }
 
-      await client.query(
-        `UPDATE publish_jobs SET status = 'publishing'::publish_status, updated_at = now() WHERE id = $1`,
-        [id]
-      );
+    const { error: e2 } = await sb.from("publish_jobs").update({ status: "publishing" }).eq("id", id);
+    if (e2) {
+      throw e2;
+    }
 
-      const fakeId = `sim_${id.slice(0, 8)}`;
-      await client.query(
-        `UPDATE publish_jobs SET
-          status = 'published'::publish_status,
-          external_post_id = $2,
-          published_at = now(),
-          updated_at = now()
-         WHERE id = $1`,
-        [id, fakeId]
-      );
+    const fakeId = `sim_${id.slice(0, 8)}`;
+    const { error: e3 } = await sb
+      .from("publish_jobs")
+      .update({
+        status: "published",
+        external_post_id: fakeId,
+        published_at: new Date().toISOString()
+      })
+      .eq("id", id);
+    if (e3) {
+      throw e3;
+    }
 
-      const pp = await client.query(
-        `INSERT INTO published_posts (
-          user_id, publish_job_id, clip_id, platform, external_post_id, caption, strategy_name, game
-        ) VALUES ($1, $2, $3, $4::platform, $5, $6, $7, $8) RETURNING *`,
-        [
-          uid,
-          id,
-          clipId,
-          job["platform"],
-          fakeId,
-          job["caption"],
-          job["strategy_name"],
-          job["game"]
-        ]
-      );
+    const strategyName = clipJoin?.content_strategies?.name ?? "";
+    const { data: pp, error: e4 } = await sb
+      .from("published_posts")
+      .insert({
+        user_id: uid,
+        publish_job_id: id,
+        clip_id: clipId,
+        platform: job.platform as string,
+        external_post_id: fakeId,
+        caption: clipJoin?.caption ?? "",
+        strategy_name: strategyName,
+        game: clipJoin?.game ?? ""
+      })
+      .select()
+      .single();
+    if (e4 || !pp) {
+      throw e4 ?? new Error("published_posts insert failed");
+    }
 
-      await insertActivityLog(client, {
-        userId: uid,
-        level: "success",
-        category: "publish",
-        message: "Publication simulée (placeholder)",
-        entityId: id,
-        entityType: "publish_job"
-      });
+    await insertActivityLog({
+      userId: uid,
+      level: "success",
+      category: "publish",
+      message: "Publication simulée (placeholder)",
+      entityId: id,
+      entityType: "publish_job"
+    });
 
-      reply.send({ ok: true, publish_job: { ...job, status: "published", external_post_id: fakeId }, published_post: pp.rows[0] });
+    reply.send({
+      ok: true,
+      publish_job: { ...job, status: "published", external_post_id: fakeId },
+      published_post: pp
     });
   });
 
   app.get("/api/published-posts", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
-    await withClient(async (client) => {
-      const r = await client.query(
-        `SELECT * FROM published_posts WHERE user_id = $1 ORDER BY published_at DESC LIMIT 500`,
-        [uid]
-      );
-      reply.send({ ok: true, posts: r.rows });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: rows, error } = await sb
+      .from("published_posts")
+      .select("*")
+      .eq("user_id", uid)
+      .order("published_at", { ascending: false })
+      .limit(500);
+    if (error) {
+      throw error;
+    }
+    reply.send({ ok: true, posts: rows ?? [] });
   });
 
   app.get("/api/activity-logs", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
@@ -751,103 +788,119 @@ export async function registerCinecontentRoutes(
     const q = z
       .object({ category: z.enum(["run", "clip", "caption", "approval", "publish", "system"]).optional() })
       .parse(request.query as Record<string, string>);
-    await withClient(async (client) => {
-      const r = q.category
-        ? await client.query(
-            `SELECT * FROM activity_logs WHERE user_id = $1 AND category = $2::log_category
-             ORDER BY created_at DESC LIMIT 300`,
-            [uid, q.category]
-          )
-        : await client.query(
-            `SELECT * FROM activity_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 300`,
-            [uid]
-          );
-      reply.send({ ok: true, logs: r.rows });
-    });
+    const sb = getSupabaseAdmin();
+    let qb = sb.from("activity_logs").select("*").eq("user_id", uid).order("created_at", { ascending: false }).limit(300);
+    if (q.category) {
+      qb = qb.eq("category", q.category);
+    }
+    const { data: rows, error } = await qb;
+    if (error) {
+      throw error;
+    }
+    reply.send({ ok: true, logs: rows ?? [] });
   });
 
   app.get("/api/settings", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
-    await withClient(async (client) => {
-      const r = await client.query(`SELECT key, value FROM app_settings WHERE user_id = $1`, [uid]);
-      const map: Record<string, string> = {};
-      for (const row of r.rows as { key: string; value: string }[]) {
-        map[row.key] = row.value;
-      }
-      reply.send({ ok: true, settings: map });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: rows, error } = await sb.from("app_settings").select("key, value").eq("user_id", uid);
+    if (error) {
+      throw error;
+    }
+    const map: Record<string, string> = {};
+    for (const row of rows ?? []) {
+      map[row.key as string] = row.value as string;
+    }
+    reply.send({ ok: true, settings: map });
   });
 
   app.put("/api/settings", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const body = settingsPutSchema.parse(request.body);
-    await withClient(async (client) => {
-      for (const [key, value] of Object.entries(body)) {
-        await client.query(
-          `INSERT INTO app_settings (user_id, key, value) VALUES ($1, $2, $3)
-           ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-          [uid, key, value]
-        );
+    const sb = getSupabaseAdmin();
+    for (const [key, value] of Object.entries(body)) {
+      const { error } = await sb.from("app_settings").upsert(
+        { user_id: uid, key, value },
+        { onConflict: "user_id,key" }
+      );
+      if (error) {
+        throw error;
       }
-      reply.send({ ok: true });
-    });
+    }
+    reply.send({ ok: true });
   });
 
   app.get("/api/integrations", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
-    await withClient(async (client) => {
-      const r = await client.query(`SELECT * FROM integrations WHERE user_id = $1`, [uid]);
-      reply.send({ ok: true, integrations: r.rows });
-    });
+    const sb = getSupabaseAdmin();
+    const { data: rows, error } = await sb.from("integrations").select("*").eq("user_id", uid);
+    if (error) {
+      throw error;
+    }
+    reply.send({ ok: true, integrations: rows ?? [] });
   });
 
   app.put("/api/integrations/:platform", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
     const platform = z.string().min(1).max(64).parse((request.params as { platform: string }).platform);
     const body = integrationPutSchema.parse(request.body);
-    await withClient(async (client) => {
-      const name = body.name ?? platform;
-      const connected = body.connected ?? false;
-      const config = body.config ?? {};
-      const cfg = JSON.stringify(config);
-      const upd = await client.query(
-        `UPDATE integrations SET name = $3, connected = $4, config = $5::jsonb, updated_at = now()
-         WHERE user_id = $1::uuid AND platform = $2
-         RETURNING *`,
-        [uid, platform, name, connected, cfg]
-      );
-      if (upd.rowCount) {
-        reply.send({ ok: true, integration: upd.rows[0] });
-        return;
-      }
-      const ins = await client.query(
-        `INSERT INTO integrations (user_id, platform, name, connected, config)
-         VALUES ($1::uuid, $2, $3, $4, $5::jsonb)
-         RETURNING *`,
-        [uid, platform, name, connected, cfg]
-      );
-      reply.send({ ok: true, integration: ins.rows[0] });
-    });
+    const name = body.name ?? platform;
+    const connected = body.connected ?? false;
+    const config = body.config ?? {};
+    const sb = getSupabaseAdmin();
+    const { data: upd, error: e1 } = await sb
+      .from("integrations")
+      .update({
+        name,
+        connected,
+        config
+      })
+      .eq("user_id", uid)
+      .eq("platform", platform)
+      .select()
+      .maybeSingle();
+    if (e1) {
+      throw e1;
+    }
+    if (upd) {
+      reply.send({ ok: true, integration: upd });
+      return;
+    }
+    const { data: ins, error: e2 } = await sb
+      .from("integrations")
+      .insert({
+        user_id: uid,
+        platform,
+        name,
+        connected,
+        config
+      })
+      .select()
+      .single();
+    if (e2 || !ins) {
+      throw e2 ?? new Error("integrations insert failed");
+    }
+    reply.send({ ok: true, integration: ins });
   });
 
   app.post("/api/ai/generate-strategy", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
@@ -857,65 +910,64 @@ export async function registerCinecontentRoutes(
   });
 
   app.get("/api/dashboard/summary", async (request, reply) => {
-    if (!env.DATABASE_URL) {
+    if (!apiDataReady()) {
       apiDisabled(reply);
       return;
     }
     const uid = request.supabaseUser!.id;
-    await withClient(async (client) => {
-      const todayRuns = await client.query(
-        `SELECT COUNT(*)::int AS c FROM runs WHERE user_id = $1 AND created_at::date = CURRENT_DATE`,
-        [uid]
-      );
-      const totalRuns = await client.query(`SELECT COUNT(*)::int AS c FROM runs WHERE user_id = $1`, [uid]);
-      const clipsReady = await client.query(
-        `SELECT COUNT(*)::int AS c FROM clips WHERE user_id = $1 AND status = 'ready_for_approval'::clip_status`,
-        [uid]
-      );
-      const pendingPublish = await client.query(
-        `SELECT COUNT(*)::int AS c FROM publish_jobs WHERE user_id = $1 AND status IN ('pending','retry')`,
-        [uid]
-      );
-      const published = await client.query(
-        `SELECT COUNT(*)::int AS c FROM published_posts WHERE user_id = $1`,
-        [uid]
-      );
-      const errors = await client.query(
-        `SELECT COUNT(*)::int AS c FROM activity_logs WHERE user_id = $1 AND level = 'error'::log_level
-         AND created_at > now() - interval '7 days'`,
-        [uid]
-      );
-      const chart = await client.query(
-        `SELECT (published_at::date)::text AS day, COALESCE(SUM(views),0)::int AS views
-         FROM published_posts
-         WHERE user_id = $1 AND published_at > now() - interval '7 days'
-         GROUP BY published_at::date
-         ORDER BY day ASC`,
-        [uid]
-      );
-      const review = await client.query(
-        `SELECT * FROM clips WHERE user_id = $1 AND status = 'ready_for_approval'::clip_status
-         ORDER BY created_at DESC LIMIT 3`,
-        [uid]
-      );
-      const logs = await client.query(
-        `SELECT * FROM activity_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5`,
-        [uid]
-      );
-      reply.send({
-        ok: true,
-        kpis: {
-          runs_today: todayRuns.rows[0]?.c ?? 0,
-          total_runs: totalRuns.rows[0]?.c ?? 0,
-          clips_ready: clipsReady.rows[0]?.c ?? 0,
-          pending_publish: pendingPublish.rows[0]?.c ?? 0,
-          published: published.rows[0]?.c ?? 0,
-          errors_week: errors.rows[0]?.c ?? 0
-        },
-        chart: chart.rows,
-        review_clips: review.rows,
-        recent_logs: logs.rows
-      });
+    const sb = getSupabaseAdmin();
+
+    const startUtc = new Date();
+    startUtc.setUTCHours(0, 0, 0, 0);
+
+    const [{ count: runsToday }, { count: totalRuns }, { count: clipsReady }, { count: pendingPublish }, { count: published }, { count: errorsWeek }, { data: postsWeek }, { data: review }, { data: logs }] =
+      await Promise.all([
+        sb.from("runs").select("*", { count: "exact", head: true }).eq("user_id", uid).gte("created_at", startUtc.toISOString()),
+        sb.from("runs").select("*", { count: "exact", head: true }).eq("user_id", uid),
+        sb.from("clips").select("*", { count: "exact", head: true }).eq("user_id", uid).eq("status", "ready_for_approval"),
+        sb.from("publish_jobs").select("*", { count: "exact", head: true }).eq("user_id", uid).in("status", ["pending", "retry"]),
+        sb.from("published_posts").select("*", { count: "exact", head: true }).eq("user_id", uid),
+        sb
+          .from("activity_logs")
+          .select("*", { count: "exact", head: true })
+          .eq("user_id", uid)
+          .eq("level", "error")
+          .gte("created_at", new Date(Date.now() - 7 * 86400000).toISOString()),
+        sb
+          .from("published_posts")
+          .select("published_at, views")
+          .eq("user_id", uid)
+          .gte("published_at", new Date(Date.now() - 7 * 86400000).toISOString()),
+        sb
+          .from("clips")
+          .select("*")
+          .eq("user_id", uid)
+          .eq("status", "ready_for_approval")
+          .order("created_at", { ascending: false })
+          .limit(3),
+        sb.from("activity_logs").select("*").eq("user_id", uid).order("created_at", { ascending: false }).limit(5)
+      ]);
+
+    const byDay = new Map<string, number>();
+    for (const p of postsWeek ?? []) {
+      const day = String(p.published_at).slice(0, 10);
+      byDay.set(day, (byDay.get(day) ?? 0) + Number(p.views ?? 0));
+    }
+    const chart = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([day, views]) => ({ day, views }));
+
+    reply.send({
+      ok: true,
+      kpis: {
+        runs_today: runsToday ?? 0,
+        total_runs: totalRuns ?? 0,
+        clips_ready: clipsReady ?? 0,
+        pending_publish: pendingPublish ?? 0,
+        published: published ?? 0,
+        errors_week: errorsWeek ?? 0
+      },
+      chart,
+      review_clips: review ?? [],
+      recent_logs: logs ?? []
     });
   });
 }
