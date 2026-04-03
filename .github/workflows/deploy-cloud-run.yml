@@ -67,8 +67,14 @@ jobs:
       - name: Deploy to Cloud Run
         env:
           GCS_BUCKET_DEPLOY: ${{ vars.GCS_BUCKET }}
+          # Clé service_role : depuis GitHub (évite Secret Manager GCP). Ne pas mettre de virgule dans la valeur.
+          SUPABASE_SERVICE_ROLE_KEY_DEPLOY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set -euo pipefail
+          if [ -z "${SUPABASE_SERVICE_ROLE_KEY_DEPLOY:-}" ]; then
+            echo "::error::Secret GitHub SUPABASE_SERVICE_ROLE_KEY manquant (Project Settings → API → service_role)."
+            exit 1
+          fi
           EXTRA_ENV=""
           if [ -n "${GCS_BUCKET_DEPLOY:-}" ]; then
             EXTRA_ENV=",GCS_BUCKET=${GCS_BUCKET_DEPLOY}"
@@ -80,5 +86,4 @@ jobs:
             --platform managed \
             --allow-unauthenticated \
             --port 8080 \
-            --set-env-vars "NODE_ENV=production,LOG_LEVEL=info,FRONTEND_DIST_PATH=/app/frontend-dist,BODY_LIMIT_BYTES=5242880,STORAGE_BACKEND=${{ vars.STORAGE_BACKEND || 'supabase' }},SUPABASE_URL=${{ secrets.SUPABASE_URL || vars.VITE_SUPABASE_URL }},DEFAULT_STORAGE_BUCKET=${{ vars.DEFAULT_STORAGE_BUCKET || 'gameplay-videos' }},PUBLIC_APP_URL=${{ vars.PUBLIC_APP_URL }},PLAYWRIGHT_HEADLESS=true,PLAYWRIGHT_NAV_TIMEOUT_MS=30000,WEBHOOK_TIMEOUT_MS=10000,MAX_RUN_TIMEOUT_MS=120000,RUN_CONCURRENCY_LIMIT=2${EXTRA_ENV}" \
-            --set-secrets "SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SERVICE_ROLE_KEY:latest"
+            --set-env-vars "NODE_ENV=production,LOG_LEVEL=info,FRONTEND_DIST_PATH=/app/frontend-dist,BODY_LIMIT_BYTES=5242880,STORAGE_BACKEND=${{ vars.STORAGE_BACKEND || 'supabase' }},SUPABASE_URL=${{ secrets.SUPABASE_URL || vars.VITE_SUPABASE_URL }},SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }},DEFAULT_STORAGE_BUCKET=${{ vars.DEFAULT_STORAGE_BUCKET || 'gameplay-videos' }},PUBLIC_APP_URL=${{ vars.PUBLIC_APP_URL }},PLAYWRIGHT_HEADLESS=true,PLAYWRIGHT_NAV_TIMEOUT_MS=30000,WEBHOOK_TIMEOUT_MS=10000,MAX_RUN_TIMEOUT_MS=120000,RUN_CONCURRENCY_LIMIT=2${EXTRA_ENV}"
